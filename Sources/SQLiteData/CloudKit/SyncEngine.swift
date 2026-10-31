@@ -27,6 +27,9 @@
     package let tablesByOrder: [String: Int]
     let foreignKeysByTableName: [String: [ForeignKey]]
     package let syncEngines = LockIsolated<SyncEngines>(SyncEngines())
+    package let statePersistence:
+      CoalescingStatePersistence<CKDatabase.Scope, CKSyncEngine.State.Serialization>
+    private let stateSerializationSources = LockIsolated<[CKDatabase.Scope: ObjectIdentifier]>([:])
     package let defaultZone: CKRecordZone
     let delegate: (any SyncEngineDelegate)?
     let defaultSyncEngines:
@@ -171,24 +174,28 @@
             private: CKSyncEngine(
               CKSyncEngine.Configuration(
                 database: container.privateCloudDatabase,
-                stateSerialization: try? metadatabase.read { db in
-                  try StateSerialization
-                    .find(#bind(.private))
-                    .select(\.data)
-                    .fetchOne(db)
-                },
+                stateSerialization:
+                  syncEngine.statePersistence.latestValue(for: .private)
+                  ?? (try? metadatabase.read { db in
+                    try StateSerialization
+                      .find(#bind(.private))
+                      .select(\.data)
+                      .fetchOne(db)
+                  }),
                 delegate: syncEngine
               )
             ),
             shared: CKSyncEngine(
               CKSyncEngine.Configuration(
                 database: container.sharedCloudDatabase,
-                stateSerialization: try? metadatabase.read { db in
-                  try StateSerialization
-                    .find(#bind(.shared))
-                    .select(\.data)
-                    .fetchOne(db)
-                },
+                stateSerialization:
+                  syncEngine.statePersistence.latestValue(for: .shared)
+                  ?? (try? metadatabase.read { db in
+                    try StateSerialization
+                      .find(#bind(.shared))
+                      .select(\.data)
+                      .fetchOne(db)
+                  }),
                 delegate: syncEngine
               )
             )
@@ -257,6 +264,18 @@
       self.defaultZone = defaultZone
       self.defaultSyncEngines = defaultSyncEngines
       self.userDatabase = userDatabase
+      self.statePersistence = CoalescingStatePersistence { takeLatest in
+        await withErrorReporting(.sqliteDataCloudKitFailure) {
+          try await userDatabase.write { db in
+            for (scope, serialization) in takeLatest() {
+              try StateSerialization.upsert {
+                StateSerialization.Draft(scope: scope, data: serialization)
+              }
+              .execute(db)
+            }
+          }
+        }
+      }
       self.logger = logger
       self.metadatabase = try defaultMetadatabase(
         logger: logger,
@@ -447,12 +466,18 @@
     private func start() throws -> Task<Void, Never> {
       guard !isRunning else { return Task {} }
       observationRegistrar.withMutation(of: self, keyPath: \.isRunning) {
-        syncEngines.withValue {
-          let (privateSyncEngine, sharedSyncEngine) = defaultSyncEngines(metadatabase, self)
-          $0 = SyncEngines(
-            private: privateSyncEngine,
-            shared: sharedSyncEngine
-          )
+        syncEngines.withValue { engines in
+          engines = stateSerializationSources.withValue { sources in
+            let (privateSyncEngine, sharedSyncEngine) = defaultSyncEngines(metadatabase, self)
+            sources = [
+              .private: ObjectIdentifier(privateSyncEngine),
+              .shared: ObjectIdentifier(sharedSyncEngine),
+            ]
+            return SyncEngines(
+              private: privateSyncEngine,
+              shared: sharedSyncEngine
+            )
+          }
         }
       }
 
@@ -729,6 +754,10 @@
     }
 
     package func tearDownSyncEngine() throws {
+      stateSerializationSources.withValue {
+        $0.removeAll()
+        statePersistence.invalidate()
+      }
       try userDatabase.write { db in
         for table in tables.reversed() {
           try table.base
@@ -1367,16 +1396,10 @@
       stateSerialization: CKSyncEngine.State.Serialization,
       syncEngine: any SyncEngineProtocol
     ) async {
-      await withErrorReporting(.sqliteDataCloudKitFailure) {
-        try await userDatabase.write { db in
-          try StateSerialization.upsert {
-            StateSerialization.Draft(
-              scope: syncEngine.database.databaseScope,
-              data: stateSerialization
-            )
-          }
-          .execute(db)
-        }
+      let scope = syncEngine.database.databaseScope
+      stateSerializationSources.withValue { sources in
+        guard sources[scope] == ObjectIdentifier(syncEngine) else { return }
+        statePersistence.enqueue(stateSerialization, for: scope)
       }
     }
 
